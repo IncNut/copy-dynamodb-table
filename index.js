@@ -1,35 +1,27 @@
 'use strict'
-var AWS = require('aws-sdk')
-var validate = require('./validate')
-var readline = require('readline')
+const { DynamoDBClient, UpdateContinuousBackupsCommand, DescribeContinuousBackupsCommand, DescribeTableCommand, ScanCommand, BatchWriteItemCommand, CreateTableCommand } = require("@aws-sdk/client-dynamodb");
+const validate = require('./validate');
+const readline = require('readline');
 
-function copy(values, fn) {
+async function copy(values) {
 
   try {
-    validate.config(values)
+    validate.config(values);
+    console.log("Validation passed");
   } catch (err) {
-    if (err) {
-      return fn(err, {
-        count: 0,
-        status: 'FAIL'
-      })
-    }
+   console.log(err);
   }
 
-  var options = {
+  const options = {
     config: values.config,
     source: {
       tableName: values.source.tableName,
-      dynamoClient: values.source.dynamoClient || new AWS.DynamoDB.DocumentClient(values.source.config || values.config),
-      dynamodb: values.source.dynamodb || new AWS.DynamoDB(values.source.config || values.config),
-      active: values.source.active
+      dynamoClient: values.source.dynamoClient || new DynamoDBClient(values.source.config || values.config)
     },
     destination: {
       tableName: values.destination.tableName,
-      dynamoClient: values.destination.dynamoClient || new AWS.DynamoDB.DocumentClient(values.destination.config || values.config),
-      dynamodb: values.destination.dynamodb || new AWS.DynamoDB(values.destination.config || values.config),
-      active: values.destination.active,
-      createTableStr: 'Creating Destination Table '
+      dynamoClient: values.destination.dynamoClient || new DynamoDBClient(values.destination.config || values.config),
+      createTableStr: `Creating Destination Table (${values.destination.tableName}) `
     },
     key: values.key,
     counter: values.counter || 0,
@@ -40,59 +32,45 @@ function copy(values, fn) {
     create: values.create,
     schemaOnly: values.schemaOnly,
     continuousBackups: values.continuousBackups
-  }
+  };
 
-  if (options.source.active && options.destination.active) { // both tables are active
-    return startCopying(options, fn)
-  }
-
-  if (options.create) { // create table if not exist
-    return options.source.dynamodb.describeTable({ TableName: options.source.tableName }, function (err, data) {
-      if (err) {
-        return fn(err, data)
-      }
-
-      options.source.active = data.Table.TableStatus === 'ACTIVE'
-      data.Table.TableName = options.destination.tableName
-      options.destination.dynamodb.createTable(clearTableSchema(data.Table), function (err) {
-        if (err && err.code !== 'ResourceInUseException') {
-          return fn(err, data)
-        }
-        waitForActive(options, fn)
-        // wait for TableStatus to be ACTIVE
-      })
-    })
-  }
-
-  checkTables(options, function (err, data) { // check if source and destination table exist
-    if (err) {
-      return fn(err, data)
+  if (options.create) {
+    const describeCommand = new DescribeTableCommand({ TableName: options.source.tableName });
+    const resp = await options.source.dynamoClient.send(describeCommand);
+    options.source.active = resp.Table.TableStatus === 'ACTIVE';
+    resp.Table.TableName = options.destination.tableName;
+    const createCommand = new CreateTableCommand(clearTableSchema(resp.Table));
+    await options.destination.dynamoClient.send(createCommand);
+    // console.log("Waiting for destination table to be active");
+    await waitForActive(options);
+    if (options.continuousBackups === "copy") { // copy backup options
+      await setContinuousBackups(options);
+    } else if(options.continuousBackups) {
+      await enableBackups(options);
     }
-    startCopying(options, fn)
-  })
+  }
 
+  await checkTables(options);
+  await startCopying(options);
 }
 
-function enableBackups(options, fn) {
-  options.destination.dynamodb.updateContinuousBackups({
+function enableBackups(options) {
+  console.log("Enabling backups");
+  const command = new UpdateContinuousBackupsCommand({
     PointInTimeRecoverySpecification: {
       PointInTimeRecoveryEnabled: true
     },
     TableName: options.destination.tableName
-  }, fn)
+  });
+  return options.destination.dynamoClient.send(command);
 }
 
-function setContinuousBackups(options, fn) {
-  options.source.dynamodb.describeContinuousBackups({ TableName: options.source.tableName }, function (err, data) {
-    if (err) {
-      return fn(err, data);
-    }
-    if (data.ContinuousBackupsDescription.ContinuousBackupsStatus === 'ENABLED') {
-      return enableBackups(options, fn);
-    }
-    fn(null)
-  })
-
+async function setContinuousBackups(options) {
+  const command = new DescribeContinuousBackupsCommand({ TableName: options.source.tableName });
+  const data = await options.source.dynamoClient.send(command);
+  if (data.ContinuousBackupsDescription.ContinuousBackupsStatus === 'ENABLED') {
+    return enableBackups(options);
+  }
 }
 
 function clearTableSchema(table) {
@@ -116,7 +94,7 @@ function clearTableSchema(table) {
   delete table.LatestStreamArn;
 
   if (table.LocalSecondaryIndexes && table.LocalSecondaryIndexes.length > 0) {
-    for (var i = 0; i < table.LocalSecondaryIndexes.length; i++) {
+    for (let i = 0; i < table.LocalSecondaryIndexes.length; i++) {
       delete table.LocalSecondaryIndexes[i].IndexStatus;
       delete table.LocalSecondaryIndexes[i].IndexSizeBytes;
       delete table.LocalSecondaryIndexes[i].ItemCount;
@@ -128,7 +106,7 @@ function clearTableSchema(table) {
 
 
   if (table.GlobalSecondaryIndexes && table.GlobalSecondaryIndexes.length > 0) {
-    for (var j = 0; j < table.GlobalSecondaryIndexes.length; j++) {
+    for (let j = 0; j < table.GlobalSecondaryIndexes.length; j++) {
       delete table.GlobalSecondaryIndexes[j].IndexStatus;
       if (table.GlobalSecondaryIndexes[j].ProvisionedThroughput.ReadCapacityUnits === 0 && table.GlobalSecondaryIndexes[j].ProvisionedThroughput.WriteCapacityUnits === 0) {
         delete table.GlobalSecondaryIndexes[j].ProvisionedThroughput
@@ -157,39 +135,28 @@ function clearTableSchema(table) {
     table.BillingMode = table.BillingModeSummary.BillingMode
   }
   delete table.BillingModeSummary;
-
   return table;
 }
 
 
-function checkTables(options, fn) {
-  options.source.dynamodb.describeTable({ TableName: options.source.tableName }, function (err, sourceData) {
-    if (err) {
-      return fn(err, sourceData)
-    }
-    if (sourceData.Table.TableStatus !== 'ACTIVE') {
-      return fn(new Error('Source table not active'), null)
-    }
-    options.source.active = true
-    options.destination.dynamodb.describeTable({ TableName: options.destination.tableName }, function (err, destData) {
-      if (err) {
-        return fn(err, destData)
-      }
-      if (destData.Table.TableStatus !== 'ACTIVE') {
-        return fn(new Error('Destination table not active'), null)
-      }
-      options.destination.active = true
-      fn(null)
-    })
-  })
+async function checkTables(options) {
+  const sourceCommand = new DescribeTableCommand({ TableName: options.source.tableName });
+  const sourceData = await options.source.dynamoClient.send(sourceCommand);
+  if (sourceData.Table.TableStatus !== 'ACTIVE') {
+    throw new Error('Source table not active');
+  }
+  const destCommand = new DescribeTableCommand({ TableName: options.destination.tableName });
+  const destData = await options.destination.dynamoClient.send(destCommand);
+  if (destData.Table.TableStatus !== 'ACTIVE') {
+    throw new Error('Destination table not active');
+  }
 }
 
-function waitForActive(options, fn) {
-  setTimeout(function () {
-    options.destination.dynamodb.describeTable({ TableName: options.destination.tableName }, function (err, data) {
-      if (err) {
-        return fn(err, data)
-      }
+function waitForActive(options) {
+  return new Promise(function (resolve) {
+    (async function checkTableStatus() {
+      const command = new DescribeTableCommand({TableName: options.destination.tableName});
+      const data = await options.destination.dynamoClient.send(command);
       if (options.log) {
         options.destination.createTableStr += '.'
         readline.clearLine(process.stdout)
@@ -197,117 +164,71 @@ function waitForActive(options, fn) {
         process.stdout.write(options.destination.createTableStr)
       }
       if (data.Table.TableStatus !== 'ACTIVE') { // wait for active
-        return waitForActive(options, fn)
+        setTimeout(checkTableStatus, 1000);
+      } else {
+        return resolve();
       }
-      options.create = false
-      options.destination.active = true
-      if (options.schemaOnly) { // schema only copied
-        return fn(err, {
-          count: options.counter,
-          schemaOnly: true,
-          status: 'SUCCESS'
-        })
-      }
-      if (options.continuousBackups) { // copy backup options
-        return setContinuousBackups(options, function (err) {
-          if (err) {
-            return fn(err, data)
-          }
-          startCopying(options, fn);
-        })
-      }
-      startCopying(options, fn);
-    })
-  }, 1000) // check every second
+    })();
+  });
 }
 
-function startCopying(options, fn) {
-  getItems(options, function (err, data) {
-    if (err) {
-      return fn(err)
+async function startCopying(options, fn) {
+  while(true) {
+    const data = await scan(options);
+    options.key = data.LastEvaluatedKey;
+    const items = mapItems(options, data);
+    await putItems(options, items);
+    if (options.log) {
+      readline.clearLine(process.stdout)
+      readline.cursorTo(process.stdout, 0)
+      process.stdout.write('Copied ' + options.counter + ' items')
     }
-    options.data = data
-    options.key = data.LastEvaluatedKey
-    putItems(options, function (err) {
-      if (err) {
-        return fn(err)
-      }
-
-      if (options.log) {
-        readline.clearLine(process.stdout)
-        readline.cursorTo(process.stdout, 0)
-        process.stdout.write('Copied ' + options.counter + ' items')
-      }
-
-      if (options.key === undefined) {
-        return fn(err, {
-          count: options.counter,
-          status: 'SUCCESS'
-        })
-      }
-      copy(options, fn)
-    })
-  })
-}
-
-function getItems(options, fn) {
-  scan(options, function (err, data) {
-    if (err) {
-      return fn(err, data)
+    if (options.key === undefined) {
+      break;
     }
-    fn(err, mapItems(options, data))
-  })
+  }
 }
 
 
-function scan(options, fn) {
-  options.source.dynamoClient.scan({
+
+async function scan(options) {
+  const command = new ScanCommand({
     TableName: options.source.tableName,
-    Limit: 25,
+    Limit: 5,
     ExclusiveStartKey: options.key
-  }, fn)
+  });
+  return options.source.dynamoClient.send(command);
 }
 
 function mapItems(options, data) {
-  data.Items = data.Items.map(function (item, index) {
+  return data.Items.map(function (item, index) {
     return {
       PutRequest: {
         Item: !!options.transform ? options.transform(item, index) : item
       }
     }
-  })
-  return data
+  });
 }
 
-function putItems(options, fn) {
-  if (!options.data.Items || options.data.Items.length === 0) {
-    return fn(null, options)
+async function putItems(options, items) {
+  if (!items || items.length === 0) {
+    return null;
   }
-  var batchWriteItems = {}
+  const batchWriteItems = {};
   batchWriteItems.RequestItems = {}
-  batchWriteItems.RequestItems[options.destination.tableName] = options.data.Items
-  options.destination.dynamoClient.batchWrite(batchWriteItems, function (err, data) {
-    if (err) {
-      return fn(err, data)
-    }
-    var unprocessedItems = data.UnprocessedItems[options.destination.tableName]
-    if (unprocessedItems !== undefined) {
-
-      options.retries++
-      options.counter += (options.data.Items.length - unprocessedItems.length)
-
-      options.data = {
-        Items: unprocessedItems
-      }
-      return setTimeout(function () {
-        putItems(options, fn)
-      }, 2 * options.retries * 100) // from aws http://docs.aws.amazon.com/general/latest/gr/api-retries.html
-
-    }
-    options.retries = 0
-    options.counter += options.data.Items.length
-    fn(err, options)
-  })
+  batchWriteItems.RequestItems[options.destination.tableName] = items;
+  const command = new BatchWriteItemCommand(batchWriteItems);
+  const data = await options.destination.dynamoClient.send(command);
+  const unprocessedItems = data.UnprocessedItems[options.destination.tableName];
+  if (unprocessedItems !== undefined) {
+    options.retries++
+    options.counter += (items.length - unprocessedItems.length);
+    return setTimeout(async function () {
+      await putItems(options, unprocessedItems);
+    }, 2 * options.retries * 100) // from aws http://docs.aws.amazon.com/general/latest/gr/api-retries.html
+  }
+  options.retries = 0;
+  options.counter += items.length;
 }
 
 module.exports.copy = copy
